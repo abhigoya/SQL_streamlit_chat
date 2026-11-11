@@ -193,6 +193,15 @@ def _str_field(value):
     return str(value) or None
 
 
+_DESC_LIMIT = 12_000  # keep well under LLM tool-result window
+
+
+def _trim_desc(value: str | None) -> str | None:
+    if value and len(value) > _DESC_LIMIT:
+        return value[:_DESC_LIMIT] + "\n\n[Description truncated — see full ticket in JIRA]"
+    return value
+
+
 def _parse_issue(issue):
     f = issue.get("fields", {})
     return {
@@ -200,7 +209,7 @@ def _parse_issue(issue):
         "summary":          (f.get("summary") or ""),
         "status":           (f.get("status") or {}).get("name"),
         "reporter":         ((f.get("reporter") or {}).get("displayName")),
-        "description":      _str_field(f.get("description")),
+        "description":      _trim_desc(_str_field(f.get("description"))),
         "cr":               _str_field(f.get("customfield_37543")),
         "test_id":          _str_field(f.get("customfield_37546")),
         "crm_build_id":     _str_field(f.get("customfield_11743")),
@@ -287,7 +296,7 @@ def run_incremental(conn, jira):
         log.info("No updated_at found — falling back to last 2 days…")
         jql = (
             "project = MSTCONF AND component in (4G_CAT, 5G_CAT) "
-            "AND updated >= -7d ORDER BY updated ASC"
+            "AND updated >= -30d ORDER BY updated ASC"
         )
     total = _fetch_and_upsert(conn, jira, jql)
     log.info("Incremental sync complete — %d tickets processed", total)

@@ -29,14 +29,17 @@ db_password = os.getenv("DB_PASSWORD")
 
 db = SQLDatabase.from_uri(
     f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}",
-    include_tables=["realtimedata", "jira_tickets"],
+    include_tables=["realtimedata", "jira_tickets", "overnight_issues"],
 )
 
 # print(f"Dialect: {db.dialect}")
 # print(f"Available tables: {db.get_usable_table_names()}")
 # print(f'Sample output: {db.run("SELECT * FROM Artist LIMIT 5;")}')
 
-llm = QGenieChat(model = "anthropic::claude-4-5-sonnet")
+llm = QGenieChat(
+    model="azure::gpt-5.6-terra",
+    timeout=280,
+)
 
 
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
@@ -167,6 +170,12 @@ Database tables:
 - jira_tickets  : JIRA ticket cache, synced daily. Key columns: ticket_key, summary, status,
                   test_id, cr, pl, modem_area, crm_build_id,
                   operator (JOIN → realtimedata.carrier), resolution_notes, created_at, updated_at.
+- overnight_issues : manually logged overnight test run failures. Columns: id, setupname,
+                  issue_type ENUM('Setup','UE','TE','Other'), issue_date DATE, start_time TIME,
+                  end_time TIME, end_date DATE (defaults to issue_date; differs from issue_date
+                  only when the issue spans midnight into the next day), description TEXT,
+                  ticket_id VARCHAR(64) NULL (UE/TE ticket ID, optional, free text), created_at
+                  DATETIME. One row per logged incident — multiple rows per setup/date are valid.
   IMPORTANT: jira_tickets.test_id stores the JIRA full format e.g. "CONF+TMO+L_5G_SA_wifi_NR_Reselect_Cause_90"
   while realtimedata.testid is the bare test name e.g. "L_5G_SA_wifi_NR_Reselect_Cause_90".
   NEVER use = for this join. Use: jt.test_id LIKE CONCAT('%', rd.testid)
@@ -246,167 +255,115 @@ For combined queries (e.g. "check if failing tests have JIRA history"):
 """
 
 _SETUP_ISSUE_ADDENDUM = """
-For setup health / UE issue queries:
+For setup health / issue queries:
 
-The key pattern to detect: TE logs are present (TEBuild populated, testresult has value)
-but UE log is absent — indicated by ue_build = '0' (string, NOT numeric 0).
-ue_build is CHAR(255) NOT NULL DEFAULT '0'; never use IS NULL to test it.
-UE_log_path is also CHAR(255) NOT NULL — never use IS NULL on it either.
-Use ue_build = '0' for "no UE log" and ue_build != '0' for "has UE log".
+IMPORTANT ROUTING RULE:
+When the user asks "are there any setup issues on <setup>?", "any issues on <setup>?",
+"what issues were logged for <setup>?", or any similar question about setup health —
+DO NOT query realtimedata or check UE logs.
+Instead, query the overnight_issues table which contains manually logged incidents.
 
---- AUTOMATIC TIME SCOPING (applies to Cases A and B only — NOT Case C) ---
+--- SETUP ISSUE QUERY (use for "any issues on X?" style questions) ---
 
-When the user does NOT specify an explicit time window, automatically apply the relevant
-monitoring window based on the current day and time. Use MySQL's DAYOFWEEK(NOW()) and
-HOUR(NOW()) to determine the window. DAYOFWEEK: 1=Sunday, 2=Mon, 3=Tue, 4=Wed, 5=Thu,
-6=Fri, 7=Saturday.
-
-WEEKDAY (DAYOFWEEK IN (2,3,4,5,6) — Monday through Friday):
-  Setup issues are expected during the unmonitored overnight period (5 PM to 10 AM).
-  Determine <window_start> and <window_end> as follows:
-  - HOUR(NOW()) < 17 → overnight window has ended for today:
-      window_start = CONCAT(DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 DAY), '%Y-%m-%d'), ':17:00:00')
-      window_end   = CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-%d'), ':10:00:00')
-      Apply: AND starttime >= window_start AND starttime <= window_end
-  - HOUR(NOW()) >= 17 → overnight window just started:
-      window_start = CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-%d'), ':17:00:00')
-      Apply: AND starttime >= window_start   (no end constraint — night is in progress)
-
-WEEKEND (DAYOFWEEK IN (7,1) — Saturday or Sunday):
-  Automation can run any time; no one is monitoring. Cover the full weekend from Friday 17:00.
-  - DAYOFWEEK(NOW()) = 7 (Saturday):
-      window_start = CONCAT(DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 DAY), '%Y-%m-%d'), ':17:00:00')
-  - DAYOFWEEK(NOW()) = 1 (Sunday):
-      window_start = CONCAT(DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 2 DAY), '%Y-%m-%d'), ':17:00:00')
-  Apply: AND starttime >= window_start   (no end constraint)
-
-Always state the window used in the "**Diagnosis:**" summary line, e.g.:
-  "Checking overnight window: 2026-05-26:17:00:00 → 2026-05-27:10:00:00" (weekday)
-  "Checking full weekend window from: 2026-05-23:17:00:00" (weekend)
-
---- CASE A: User asks about ALL setups (no specific setup named, no time filter) ---
-
-Run this SINGLE query — replace the static NOW()-INTERVAL filter with the automatic window above:
-
-  SELECT rd.setupname,
-         COUNT(*) AS tests_without_ue_log,
-         MIN(rd.starttime) AS issue_started_at,
-         MAX(rd.starttime) AS latest_test_time
-  FROM realtimedata rd
-  LEFT JOIN (
-    SELECT setupname, MAX(starttime) AS last_ue_log_time
-    FROM realtimedata
-    WHERE ue_build != '0'
-    GROUP BY setupname
-  ) lu ON rd.setupname = lu.setupname
-  WHERE rd.starttime > COALESCE(lu.last_ue_log_time, '2000-01-01')
-    AND rd.starttime >= <window_start>
-    [AND rd.starttime <= <window_end>  -- only on weekday before-5PM case]
-  GROUP BY rd.setupname
-  HAVING COUNT(*) > 0
-  ORDER BY tests_without_ue_log DESC
-
-Present results as a table: setupname | tests_without_ue_log | issue_started_at | latest_test_time
-If 0 rows → "No UE issues detected in the [overnight / weekend] window."
-
---- CASE B: User asks about a SPECIFIC setup with NO time window filter ---
-(Use this only when user is asking about the CURRENT state: "is there an issue now?")
-
-CRITICAL: The inner subquery finding the last good UE log MUST remain unfiltered by time
-(it needs all history to correctly anchor the detection point).
-Apply the automatic time window ONLY to the outer WHERE clauses in Query 2 and Query 3.
-
-Query 1 — Find when UE logs last saved (NO starttime filter — unchanged):
-  SELECT starttime AS last_ue_log_time, testid AS last_test_with_ue_log
-  FROM realtimedata
+Run this query:
+  SELECT setupname, issue_date, start_time, end_date, end_time, issue_type, ticket_id, description
+  FROM overnight_issues
   WHERE setupname LIKE '%<setup>%'
-    AND ue_build != '0'
-  ORDER BY starttime DESC
-  LIMIT 1
+  ORDER BY setupname, issue_date DESC, created_at ASC
 
-Query 2 — Count tests without UE log in the monitoring window:
-  SELECT COUNT(*) AS tests_without_ue_log,
-         MIN(starttime) AS issue_started_at,
-         MAX(starttime) AS latest_test_time
-  FROM realtimedata
-  WHERE setupname LIKE '%<setup>%'
-    AND starttime > (
-      SELECT COALESCE(MAX(starttime), '2000-01-01')
-      FROM realtimedata
-      WHERE setupname LIKE '%<setup>%'
-        AND ue_build != '0'
-      /* NO starttime filter here — must look at all history */
-    )
-    AND starttime >= <window_start>
-    [AND starttime <= <window_end>  -- only on weekday before-5PM case]
+If the user also specifies a date or date range, add:
+  AND issue_date = '<date>'   -- or BETWEEN '<start>' AND '<end>'
 
-Query 3 — Recent test detail within the monitoring window:
-  SELECT testid, testresult, starttime, TEBuild, ue_build, UE_log_path
-  FROM realtimedata
-  WHERE setupname LIKE '%<setup>%'
-    AND starttime >= <window_start>
-    [AND starttime <= <window_end>  -- only on weekday before-5PM case]
-  ORDER BY starttime DESC
-  LIMIT 10
+If the user asks specifically about issue type (e.g. "setup issues only", "UE issues"):
+  AND issue_type = 'Setup'   -- or 'UE', 'TE', 'Other'
 
-Diagnosis rules (Case B):
-- tests_without_ue_log >= 1 → UE issue is ongoing in the monitoring window
-  → "UE issue detected since <issue_started_at>. <N> test cases ran without UE logs."
-- tests_without_ue_log = 0 → No issue in the monitoring window
-  → "No setup issue detected in the [overnight / weekend] window. Last UE log saved at <last_ue_log_time>."
+Present as a markdown table with columns: Setup | Start | End | Type | Ticket | Description
 
---- CASE C: User has an explicit time window filter OR is asking about a past period ---
-(Use this when user specifies starttime >= X, or asks "were there issues", "what happened",
- or points to a specific past timestamp — the issue may have already recovered.)
+START/END COLUMN RULE — combine each date+time pair into a single column value:
+- Start column = issue_date + start_time, e.g. "2026-06-15 08:00:00"
+- End column = end_date + end_time, e.g. "2026-06-15 10:00:00" (or "2026-06-16 06:00:00" when
+  the issue spanned midnight, since end_date differs from issue_date in that case)
 
-Even though the user specifies a time window, ALWAYS apply the monitored-hours filter
-within that window — only rows during unmonitored periods are relevant:
-  - Weekend rows (DAYOFWEEK 1=Sunday or 7=Saturday): any hour
-  - Weekday rows (DAYOFWEEK 2–6): overnight only — hour >= 17 OR hour < 10
+MERGE RULE — like Excel merged cells:
+- setupname: print the value only on the FIRST row for that setup; leave blank for all subsequent rows of the same setup.
+- Start, End, issue_type, ticket_id, and description: always printed on every row (each row's Start/End already carries its own date, so no separate date-merge is needed).
 
-NOTE: starttime is stored as 'YYYY-MM-DD:HH:MM:SS' (colon between date and time).
-Extract hour as: CAST(SUBSTRING(starttime, 12, 2) AS UNSIGNED)
-Extract date as: SUBSTRING(starttime, 1, 10)  -- valid input for DAYOFWEEK()
+Example with 2 setups, LAB1277 having 2 incidents (one spanning midnight):
 
-Run this gaps-and-islands query to find ALL streaks of missing UE logs in the window:
+| Setup   | Start               | End                 | Type  | Ticket        | Description          |
+|---------|---------------------|---------------------|-------|---------------|-----------------------|
+| LAB1277 | 2026-06-15 08:00:00 | 2026-06-15 10:00:00 | Setup |               | Router rebooted      |
+|         | 2026-06-15 23:00:00 | 2026-06-16 06:00:00 | UE    | UE-4521       | UE not responding    |
+|         | 2026-06-14 22:00:00 | 2026-06-14 23:00:00 | TE    |               | TE build mismatch    |
+| LAB0315 | 2026-06-15 06:00:00 | 2026-06-15 06:30:00 | Setup |               | Automation not start |
 
-  SELECT MIN(starttime) AS streak_started,
-         MAX(starttime) AS streak_ended,
-         COUNT(*) AS tests_no_ue_log
-  FROM (
-    SELECT starttime,
-           SUM(CASE WHEN ue_build != '0' THEN 1 ELSE 0 END)
-             OVER (ORDER BY starttime ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS good_ue_count
-    FROM realtimedata
-    WHERE setupname LIKE '%<setup>%'
-      AND starttime >= '<user_starttime_filter>'
-      AND (
-        -- Weekend: any hour counts
-        DAYOFWEEK(SUBSTRING(starttime, 1, 10)) IN (1, 7)
-        OR
-        -- Weekday: overnight hours only (17:00–09:59)
-        (
-          DAYOFWEEK(SUBSTRING(starttime, 1, 10)) BETWEEN 2 AND 6
-          AND (
-            CAST(SUBSTRING(starttime, 12, 2) AS UNSIGNED) >= 17
-            OR CAST(SUBSTRING(starttime, 12, 2) AS UNSIGNED) < 10
-          )
-        )
-      )
-  ) t
-  WHERE ue_build = '0'
-  GROUP BY good_ue_count
-  HAVING COUNT(*) >= 5
-  ORDER BY streak_started
+If 0 rows → "No issues have been logged for <setup> in the issue log."
 
-This finds every contiguous streak of 5+ consecutive monitored-hours tests without UE logs.
-Present as: streak_started | streak_ended | tests_no_ue_log
-If 0 rows → "No UE issues (streaks of 5+ consecutive missing UE logs) found in this period
-             during monitored hours (weekday nights 17:00–10:00 and full weekends)."
+--- ALL-SETUPS ISSUE SUMMARY (use for "any issues logged last night?" with no specific setup) ---
 
-Always present:
-1. A bold "**Diagnosis:** ..." summary line first (include the monitoring window used)
-2. Then the streak table or detail table
+  SELECT setupname, issue_date, start_time, end_date, end_time, issue_type, ticket_id, description
+  FROM overnight_issues
+  WHERE issue_date = CURDATE() OR issue_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+  ORDER BY setupname, issue_date DESC, created_at ASC
+
+Apply the same MERGE RULE and START/END COLUMN RULE above when presenting results.
+If 0 rows → "No issues logged for the last two days."
+
+--- DOWNTIME SUMMARY (always run alongside either query above, unless 0 rows) ---
+
+Older rows only have start_time logged, not end_time (that column was added later). For any
+row where end_time IS NULL, treat the downtime as a flat 8 hours instead of computing it.
+
+Also compute day-coverage columns. total_days_in_range must ALWAYS reflect the size of the
+search window itself (the filter), and must NEVER be derived from which dates happen to have
+matching rows — using MIN/MAX(issue_date) of the matched data undercounts, because any
+issue-free days at the edges of the window silently disappear from that calculation:
+
+- days_issue_noticed = COUNT(DISTINCT issue_date) — how many distinct days within the filtered
+  window had at least one logged incident for that setup.
+- total_days_in_range = size of the actual search window, from literal date bounds:
+  - Explicit single date, explicit date range, an open-ended date ("from June 1", "since June 1"
+    — end defaults to CURDATE()), OR a relative phrase ("last 30 days", "past week", "this month",
+    etc.) — first translate into literal bounds (e.g. "last 30 days" → start = CURDATE() -
+    INTERVAL 29 DAY, end = CURDATE(); "from June 1" → start = '2026-06-01', end = CURDATE()),
+    then use those SAME literal bounds both in the WHERE clause and here:
+    DATEDIFF('<filter_end>', '<filter_start>') + 1.
+    All of the above count as explicit — do not fall through to the no-filter case below.
+  - Default ALL-SETUPS nightly query (today OR yesterday, no user-specified range) → 2.
+  - No date filter given at all (pure "any issues on X?" with no time bound) → use the full
+    history of the log across ALL setups (the shared tracking window), not this setup's own
+    issue span: DATEDIFF(CURDATE(), (SELECT MIN(issue_date) FROM overnight_issues)) + 1.
+    This value is the same for every setup in the result since it reflects how long incidents
+    have been logged at all, not when this particular setup happened to have one.
+
+Run this as a second query, reusing the same WHERE filters as whichever detail query above
+was used (same setup filter and/or same date filter):
+
+  SELECT setupname,
+    COUNT(DISTINCT issue_date) AS days_issue_noticed,
+    <total_days_expression as derived above> AS total_days_in_range,
+    ROUND(SUM(
+      CASE
+        WHEN end_time IS NOT NULL THEN
+          TIMESTAMPDIFF(MINUTE, TIMESTAMP(issue_date, start_time),
+                                 TIMESTAMP(COALESCE(end_date, issue_date), end_time)) / 60.0
+        ELSE 8.0
+      END
+    ), 1) AS total_downtime_hours
+  FROM overnight_issues
+  WHERE <same filters as the detail query>
+  GROUP BY setupname
+  ORDER BY total_downtime_hours DESC
+
+Present the result as a separate table titled "Total Downtime by Setup" directly below the
+incident detail table:
+
+| Setup   | Total Days (Filter Range) | Days Issue Noticed | Total Downtime (hrs) |
+|---------|----------------------------|---------------------|-----------------------|
+| LAB1277 | 7                          | 2                   | 9.5                   |
+| LAB0315 | 7                          | 1                   | 8.0                   |
+
+Skip this summary table entirely if the detail query returned 0 rows.
 """
 
 _JIRA_ONLY_ADDENDUM = """
@@ -451,6 +408,9 @@ always structure the response in this order:
 
 Include all fields that are non-null. Omit rows where the value is NULL or empty.
 For this query, fetch description and resolution_notes columns in addition to the standard ones.
+If the description ends with "[Description truncated — see full ticket in JIRA]", include that note
+verbatim at the end of The Issue section. NEVER say "the description has been added as an attachment"
+or any similar attachment language — there are no attachments in this system.
 """
 
 

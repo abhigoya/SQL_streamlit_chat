@@ -11,8 +11,31 @@ from dotenv import load_dotenv
 import datetime as dt
 from datetime import datetime
 import dashboard
+import issue_log
 
 load_dotenv(override=True)
+
+# --- API key file cache (per-user on their local machine) ---
+_KEY_CACHE = pathlib.Path.home() / ".conf_ai" / "api_key"
+
+def _load_cached_key() -> str:
+    try:
+        return _KEY_CACHE.read_text().strip()
+    except Exception:
+        return ""
+
+def _save_cached_key(key: str) -> None:
+    try:
+        _KEY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _KEY_CACHE.write_text(key)
+    except Exception:
+        pass
+
+def _clear_cached_key() -> None:
+    try:
+        _KEY_CACHE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 # --- Logging setup ---
 log_dir = pathlib.Path(__file__).parent / "logs"
@@ -29,36 +52,35 @@ log.info("Streamlit app started")
 
 st.set_page_config(page_title="Conf AI Dashboard", page_icon="🗄️", layout="wide")
 
-# --- API Key gate ---
-# Always ask the user for their key on a fresh session; never auto-fill from .env
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.5rem; }
+    div[data-testid="stMetric"] {
+        padding-top: 0rem;
+        padding-bottom: 0rem;
+    }
+    div[data-testid="stDivider"] {
+        margin-top: 0.25rem;
+        margin-bottom: 0.25rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- API key session state (loaded from local cache on first run) ---
 if "qgenie_api_key" not in st.session_state:
-    st.session_state.qgenie_api_key = ""
+    st.session_state.qgenie_api_key = _load_cached_key()
 if "api_key_error" not in st.session_state:
     st.session_state.api_key_error = ""
 
-if not st.session_state.qgenie_api_key:
-    st.markdown("Please enter your **QGenie API Key** to get started.")
-    if st.session_state.api_key_error:
-        st.error(st.session_state.api_key_error)
-    with st.form("api_key_form"):
-        entered_key = st.text_input("QGenie API Key", type="password", placeholder="Enter your API key...")
-        st.markdown('<p style="color:#4A90D9;">Get your QGENIE_API_KEY from: <a href="https://qpilot.qualcomm.com/api_key" style="color:#F4A261; font-weight:bold;">https://qpilot.qualcomm.com/api_key</a></p>', unsafe_allow_html=True)
-        submitted = st.form_submit_button("Continue")
-        if submitted:
-            if entered_key.strip():
-                st.session_state.qgenie_api_key = entered_key.strip()
-                st.session_state.api_key_error = ""
-                os.environ["QGENIE_API_KEY"] = entered_key.strip()
-                st.rerun()
-            else:
-                st.error("API key cannot be empty.")
-    st.stop()
-
-# Key is confirmed — make it available in os.environ for downstream use
-os.environ["QGENIE_API_KEY"] = st.session_state.qgenie_api_key
-
-# Import agent only after the key is in os.environ so QGenieChat picks up the real key
-from SQL_langrapgh import agent
+# If we have a key, make it available for agent import
+if st.session_state.qgenie_api_key:
+    os.environ["QGENIE_API_KEY"] = st.session_state.qgenie_api_key
+    from SQL_langrapgh import agent
+else:
+    agent = None
 
 st.title("Conf AI Dashboard")
 st.caption("Ask questions about the realtimedata database.")
@@ -96,21 +118,23 @@ def _db_conn():
 
 
 @st.cache_data(show_spinner=False)
-def fetch_setup_combined() -> list:
-    """Return 'LAB1234: KEYS - TMO 5G_Protocol' style entries."""
+def fetch_setup_combined() -> list[dict]:
+    """Return list of {display, team} dicts for all labelled setups."""
     try:
         con = _db_conn()
         cur = con.cursor()
         cur.execute("""
-            SELECT DISTINCT CONCAT(sl.setupname, ': ', sl.setup, ' - ', sl.operator, ' ', sl.area) AS display
+            SELECT DISTINCT
+                CONCAT(sl.setupname, ': ', sl.setup, ' - ', sl.operator, ' ', sl.area) AS display,
+                COALESCE(sl.team, '') AS team
             FROM realtimedata r
             LEFT JOIN setup_labels sl ON r.setupname = sl.setupname
             WHERE sl.setup IS NOT NULL AND sl.operator IS NOT NULL AND sl.area IS NOT NULL
             ORDER BY display
         """)
-        values = [row[0] for row in cur.fetchall()]
+        rows = cur.fetchall()
         con.close()
-        return values
+        return [{"display": row[0], "team": row[1]} for row in rows]
     except Exception as e:
         log.warning(f"Could not fetch setup combined labels: {e}")
         return []
@@ -131,10 +155,30 @@ if "traces" not in st.session_state:
 # Sidebar: filters + clear history button
 with st.sidebar:
     st.header("Filters")
+    _all_setups = fetch_setup_combined()
+    _team_options = sorted({s["team"] for s in _all_setups if s["team"]})
+
+    def _reset_setup():
+        st.session_state.pop("selected_setup_widget", None)
+
+    selected_team = st.multiselect(
+        "Team", _team_options, placeholder="All teams",
+        key="selected_team_widget", on_change=_reset_setup
+    )
+
+    _filtered_setups = (
+        [s["display"] for s in _all_setups if s["team"] in selected_team]
+        if selected_team else
+        [s["display"] for s in _all_setups]
+    )
+    selected_setup = st.multiselect(
+        "Setup Name", _filtered_setups, placeholder="All setups",
+        key="selected_setup_widget"
+    )
+
     _ALLOWED_CARRIERS = {"TMO", "ATT", "AT&T", "GCF", "VZW"}
     carrier_options = [c for c in fetch_distinct("carrier") if c in _ALLOWED_CARRIERS]
     selected_carrier = st.multiselect("Carrier", carrier_options, placeholder="All carriers")
-    selected_setup = st.multiselect("Setup Name", fetch_setup_combined(), placeholder="All setups")
     st.caption("Start Time")
     s_col1, s_col2 = st.columns(2)
     start_date = s_col1.date_input("Date", value=None, key="start_date", label_visibility="collapsed")
@@ -283,25 +327,67 @@ def _render_step(node: str, node_state: dict, label: str) -> None:
 if "dashboard_loaded" not in st.session_state:
     st.session_state.dashboard_loaded = False
 
-tab_chat, tab_dashboard = st.tabs(["Chat", "Dashboard"])
-
-with tab_dashboard:
-    if not st.session_state.dashboard_loaded:
-        st.info("Click the button below to load the dashboard.")
-        if st.button("Load Dashboard"):
-            st.session_state.dashboard_loaded = True
-            st.rerun()
-    else:
-        if selected_setup:
-            resolved_setups = resolve_combined_setups(tuple(selected_setup))
-            if not resolved_setups:
-                st.info("No setups match the selected Setup filters.")
-                resolved_setups = ('__no_match__',)
-        else:
-            resolved_setups = ()
-        dashboard.render(tuple(selected_carrier), resolved_setups, selected_starttime, selected_endtime)
+tab_chat, tab_dashboard, tab_issues = st.tabs(
+    ["Chat", "Dashboard", "Setup Comments"]
+)
 
 with tab_chat:
+    # --- API key UI (inline in Chat tab) ---
+    if not st.session_state.qgenie_api_key:
+        st.markdown("### ⚠️ QGenie API Key required")
+        if st.session_state.api_key_error:
+            st.error(st.session_state.api_key_error)
+        with st.form("api_key_form"):
+            entered_key = st.text_input("QGenie API Key", type="password", placeholder="Enter your API key...")
+            remember = st.checkbox("Remember on this device", value=True)
+            st.markdown('<p style="color:#4A90D9;">Get your key from: <a href="https://qpilot.qualcomm.com/api_key" style="color:#F4A261; font-weight:bold;">https://qpilot.qualcomm.com/api_key</a></p>', unsafe_allow_html=True)
+            submitted = st.form_submit_button("Continue")
+        if submitted:
+            if entered_key.strip():
+                st.session_state.qgenie_api_key = entered_key.strip()
+                st.session_state.api_key_error = ""
+                os.environ["QGENIE_API_KEY"] = entered_key.strip()
+                if remember:
+                    _save_cached_key(entered_key.strip())
+                else:
+                    _clear_cached_key()
+                st.rerun()
+            else:
+                st.error("API key cannot be empty.")
+    else:
+        # --- Change key expander (shown when key is already set) ---
+        st.markdown(
+            """
+            <style>
+            .st-key-change_key_expander [data-testid="stExpander"] summary {
+                background-color: rgba(244, 162, 97, 0.15);
+                border: 1px solid #F4A261;
+                border-radius: 6px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.expander("Change API Key", expanded=False, icon="⚠️", key="change_key_expander"):
+            st.caption("If your questions are failing with an authentication error, your key may have expired — enter a new one below.")
+            with st.form("change_key_form", clear_on_submit=True):
+                new_key = st.text_input("New QGenie API Key", type="password", placeholder="Enter new key...")
+                remember_new = st.checkbox("Remember on this device", value=True)
+                change_submitted = st.form_submit_button("Update Key")
+            if change_submitted:
+                if new_key.strip():
+                    st.session_state.qgenie_api_key = new_key.strip()
+                    st.session_state.api_key_error = ""
+                    os.environ["QGENIE_API_KEY"] = new_key.strip()
+                    if remember_new:
+                        _save_cached_key(new_key.strip())
+                    else:
+                        _clear_cached_key()
+                    import sys; sys.modules.pop("SQL_langrapgh", None)
+                    st.rerun()
+                else:
+                    st.warning("Key cannot be empty.")
+
     # Render existing chat messages with their reasoning traces
     turn_index = 0
     for msg in st.session_state.history:
@@ -317,13 +403,23 @@ with tab_chat:
 
     # User input
     if user_query := st.chat_input("Ask a question about the database..."):
-        # Build filter context string to prepend to the query
         filter_parts = []
         if selected_carrier:
             vals = ", ".join(f"'{v}'" for v in selected_carrier)
             filter_parts.append(f"carrier IN ({vals})")
         if selected_setup:
             resolved = resolve_combined_setups(tuple(selected_setup))
+            if resolved:
+                vals = ", ".join(f"'{v}'" for v in resolved)
+                filter_parts.append(f"setupname IN ({vals})")
+            else:
+                filter_parts.append("setupname IN ('__no_matching_setup__')")
+        elif selected_team:
+            resolved = tuple(
+                s["display"].split(": ")[0]
+                for s in _all_setups
+                if s["team"] in selected_team
+            )
             if resolved:
                 vals = ", ".join(f"'{v}'" for v in resolved)
                 filter_parts.append(f"setupname IN ({vals})")
@@ -371,6 +467,7 @@ with tab_chat:
                         log.warning("Invalid API key — resetting key gate")
                         st.session_state.qgenie_api_key = ""
                         st.session_state.api_key_error = "Invalid or expired API key. Please enter a valid key."
+                        _clear_cached_key()
                         import sys; sys.modules.pop("SQL_langrapgh", None)
                         st.rerun()
                     final_answer = f"An error occurred: {e}"
@@ -408,3 +505,31 @@ with tab_chat:
             render_response(final_answer, render_key="current")
 
         st.rerun()
+
+with tab_dashboard:
+    if not st.session_state.dashboard_loaded:
+        st.info("Click the button below to load the dashboard.")
+        if st.button("Load Dashboard"):
+            st.session_state.dashboard_loaded = True
+            st.rerun()
+    else:
+        if selected_setup:
+            resolved_setups = resolve_combined_setups(tuple(selected_setup))
+            if not resolved_setups:
+                st.info("No setups match the selected Setup filters.")
+                resolved_setups = ('__no_match__',)
+        elif selected_team:
+            # Team selected but no specific setup — restrict to all setups under that team
+            resolved_setups = tuple(
+                s["display"].split(": ")[0]
+                for s in _all_setups
+                if s["team"] in selected_team
+            )
+            if not resolved_setups:
+                resolved_setups = ('__no_match__',)
+        else:
+            resolved_setups = ()
+        dashboard.render(tuple(selected_carrier), resolved_setups, selected_starttime, selected_endtime)
+
+with tab_issues:
+    issue_log.render_issue_log_tab()

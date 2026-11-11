@@ -8,6 +8,9 @@ from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, JsCode
 
 load_dotenv(override=True)
 
+JIRA_BASE_URL = os.getenv("JIRA_BROWSE_URL", os.getenv("JIRA_URL", "")).rstrip("/")
+ORBIT_BASE_URL = os.getenv("ORBIT_URL", "https://orbit").rstrip("/")
+
 
 def _get_connection():
     return pymysql.connect(
@@ -56,7 +59,10 @@ def _load_data(carrier: tuple, setupname: tuple, starttime, endtime) -> pd.DataF
             TE_file_path,
             UE_log_path,
             Reason,
-            MAiLAF
+            NeedsRCA,
+            MAiLAF,
+            Claude,
+            comments
         FROM realtimedata
         WHERE {where}
     """
@@ -72,8 +78,48 @@ def _load_data(carrier: tuple, setupname: tuple, starttime, endtime) -> pd.DataF
     return df
 
 
-def _update_rows(test_ids: list, ue_build: str, test_result: str) -> int:
-    """Update ue_build and/or testresult for the given testid values.
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_jira_matches(testids: tuple) -> dict:
+    """Batch-match realtimedata testids against jira_tickets.test_id via suffix LIKE.
+
+    jira_tickets.test_id is stored in an inconsistent format (e.g. CONF+TMO+<testid>,
+    or no prefix at all), so matches use a suffix LIKE rather than an exact match —
+    same convention used by the chat agent (SQL_langrapgh.py).
+
+    Uses a temporary table rather than a UNION ALL values-list: with thousands of
+    distinct testids, a long UNION ALL chain overflows MySQL's thread stack.
+
+    Also returns jira_tickets.cr (Orbit CR number synced from JIRA's Orbit-CR custom
+    field) alongside the ticket key — this only covers CRs that went through a JIRA
+    ticket; CRs raised directly in Orbit have no JIRA row and won't appear here.
+    """
+    if not testids:
+        return {}
+    con = _get_connection()
+    try:
+        with con.cursor() as cur:
+            cur.execute("SET SESSION group_concat_max_len = 10000")
+            cur.execute("CREATE TEMPORARY TABLE tmp_testids (testid VARCHAR(255) PRIMARY KEY)")
+            cur.executemany(
+                "INSERT IGNORE INTO tmp_testids (testid) VALUES (%s)",
+                [(t,) for t in testids],
+            )
+            cur.execute("""
+                SELECT v.testid AS rd_testid,
+                       GROUP_CONCAT(DISTINCT jt.ticket_key ORDER BY jt.ticket_key SEPARATOR ',') AS ticket_keys,
+                       GROUP_CONCAT(DISTINCT jt.cr ORDER BY jt.cr SEPARATOR ',') AS crs
+                FROM tmp_testids v
+                JOIN jira_tickets jt ON jt.test_id LIKE CONCAT('%%', v.testid)
+                GROUP BY v.testid
+            """)
+            rows = cur.fetchall()
+    finally:
+        con.close()
+    return {row[0]: {"ticket_keys": row[1], "crs": row[2]} for row in rows}
+
+
+def _update_rows(test_ids: list, ue_build: str, test_result: str, comments: str) -> int:
+    """Update ue_build, testresult, and/or comments for the given testid values.
 
     Only non-empty fields are included in the SET clause.
     Returns the number of rows actually updated.
@@ -85,6 +131,9 @@ def _update_rows(test_ids: list, ue_build: str, test_result: str) -> int:
     if test_result:
         set_parts.append("testresult = %s")
         params.append(test_result)
+    if comments.strip():
+        set_parts.append("comments = %s")
+        params.append(comments.strip())
     if not set_parts:
         return 0
     set_clause = ", ".join(set_parts)
@@ -139,10 +188,17 @@ def render(carrier: tuple, setupname: tuple, starttime, endtime):
     st.subheader("Test Cases")
     all_tests = df.sort_values("starttime", ascending=False).copy()
 
-    export_cols = ["carrier","setupname", "starttime", "testid", "testresult", "Execmode", "duration", "ue_build", "TEBuild", "TE_file_path", "UE_log_path", "Reason", "MAiLAF"]
+    jira_matches = _load_jira_matches(tuple(sorted(all_tests["testid"].dropna().unique())))
+    all_tests["jira_id"] = all_tests["testid"].map(lambda t: jira_matches.get(t, {}).get("ticket_keys"))
+    all_tests["cr"] = all_tests["testid"].map(lambda t: jira_matches.get(t, {}).get("crs"))
+    all_tests.loc[all_tests["testresult"] == "PASS", ["jira_id", "cr"]] = None
+
+    export_cols = ["carrier","setupname", "starttime", "testid", "testresult", "Execmode", "duration", "ue_build", "TEBuild", "TE_file_path", "UE_log_path", "Reason", "NeedsRCA", "MAiLAF", "Claude", "jira_id", "cr", "comments"]
     all_tests_export = all_tests[export_cols].rename(columns={
         "setupname": "Setup",
         "testid": "Test ID",
+        "jira_id": "JIRA ID",
+        "cr": "CR",
         "carrier": "Carrier",
         "testresult": "Result",
         "Execmode": "Exec Mode",
@@ -153,28 +209,21 @@ def render(carrier: tuple, setupname: tuple, starttime, endtime):
         "TE_file_path": "TE Log Path",
         "UE_log_path": "UE Log Path",
         "Reason": "TE Fail Reason",
+        "NeedsRCA": "AutoD",
         "MAiLAF": "MAiLAF",
+        "Claude": "Claude",
+        "comments": "Manual Comments",
     })
 
     # --- Excel-like set filters ---
     f1, f2, f3 = st.columns(3)
-    f4, f5, f6 = st.columns(3)
-    sel_setupname = f1.multiselect("Setup Name", sorted(all_tests_export["Setup"].dropna().unique()))
-    sel_test_id   = f2.multiselect("Test ID",    sorted(all_tests_export["Test ID"].dropna().unique()))
-    sel_result    = f3.multiselect("Result",     sorted(all_tests_export["Result"].dropna().unique()))
-    sel_carrier   = f4.multiselect("Carrier",    sorted(all_tests_export["Carrier"].dropna().unique()))
-    sel_ue_build  = f5.multiselect("UE Build",   sorted(all_tests_export["UE Build"].dropna().unique()))
-    sel_te_build  = f6.multiselect("TE Build",   sorted(all_tests_export["TE Build"].dropna().unique()))
+    sel_result   = f1.multiselect("Result",   sorted(all_tests_export["Result"].dropna().unique()))
+    sel_ue_build = f2.multiselect("UE Build", sorted(all_tests_export["UE Build"].dropna().unique()))
+    sel_te_build = f3.multiselect("TE Build", sorted(all_tests_export["TE Build"].dropna().unique()))
 
     filtered_export = all_tests_export.copy()
-    if sel_setupname:
-        filtered_export = filtered_export[filtered_export["Setup"].isin(sel_setupname)]
-    if sel_test_id:
-        filtered_export = filtered_export[filtered_export["Test ID"].isin(sel_test_id)]
     if sel_result:
         filtered_export = filtered_export[filtered_export["Result"].isin(sel_result)]
-    if sel_carrier:
-        filtered_export = filtered_export[filtered_export["Carrier"].isin(sel_carrier)]
     if sel_ue_build:
         filtered_export = filtered_export[filtered_export["UE Build"].isin(sel_ue_build)]
     if sel_te_build:
@@ -210,6 +259,53 @@ def render(carrier: tuple, setupname: tuple, starttime, endtime):
     gb.configure_column("TE Log Path", cellRenderer=_link_renderer)
     gb.configure_column("UE Log Path", cellRenderer=_link_renderer)
     gb.configure_column("MAiLAF", cellRenderer=_link_renderer)
+    gb.configure_column("Claude", cellRenderer=_link_renderer)
+
+    _jira_link_renderer = JsCode(f"""
+        class JiraLinkRenderer {{
+            init(params) {{
+                this.eGui = document.createElement('span');
+                if (params.value && params.value.trim() !== '') {{
+                    var keys = params.value.split(',').map(s => s.trim()).filter(Boolean);
+                    keys.forEach((key, idx) => {{
+                        var a = document.createElement('a');
+                        a.href = '{JIRA_BASE_URL}/browse/' + key;
+                        a.innerText = key;
+                        a.target = '_blank';
+                        a.style.color = '#4da6ff';
+                        a.style.textDecoration = 'underline';
+                        this.eGui.appendChild(a);
+                        if (idx < keys.length - 1) this.eGui.appendChild(document.createTextNode(', '));
+                    }});
+                }}
+            }}
+            getGui() {{ return this.eGui; }}
+        }}
+    """)
+    gb.configure_column("JIRA ID", cellRenderer=_jira_link_renderer)
+
+    _cr_link_renderer = JsCode(f"""
+        class CrLinkRenderer {{
+            init(params) {{
+                this.eGui = document.createElement('span');
+                if (params.value && params.value.trim() !== '') {{
+                    var crs = params.value.split(',').map(s => s.trim()).filter(Boolean);
+                    crs.forEach((cr, idx) => {{
+                        var a = document.createElement('a');
+                        a.href = '{ORBIT_BASE_URL}/CR/' + cr;
+                        a.innerText = cr;
+                        a.target = '_blank';
+                        a.style.color = '#4da6ff';
+                        a.style.textDecoration = 'underline';
+                        this.eGui.appendChild(a);
+                        if (idx < crs.length - 1) this.eGui.appendChild(document.createTextNode(', '));
+                    }});
+                }}
+            }}
+            getGui() {{ return this.eGui; }}
+        }}
+    """)
+    gb.configure_column("CR", cellRenderer=_cr_link_renderer)
 
     grid_options = gb.build()
 
@@ -246,15 +342,16 @@ def render(carrier: tuple, setupname: tuple, starttime, endtime):
                 index=0,
                 format_func=lambda x: "(no change)" if x == "" else x,
             )
+            new_comments = st.text_area("Comments", value="", placeholder="Leave blank to skip")
             submitted = st.form_submit_button("Update Selected")
 
         if submitted:
-            if not new_ue_build.strip() and not new_test_result:
-                st.warning("No fields to update — enter a UE Build or select a Test Result.")
+            if not new_ue_build.strip() and not new_test_result and not new_comments.strip():
+                st.warning("No fields to update — enter a UE Build, select a Test Result, or add a Comment.")
             else:
                 test_ids = selected_rows["Test ID"].tolist()
                 try:
-                    rows_updated = _update_rows(test_ids, new_ue_build, new_test_result)
+                    rows_updated = _update_rows(test_ids, new_ue_build, new_test_result, new_comments)
                     if rows_updated > 0:
                         st.success(f"Updated {rows_updated} row(s) successfully.")
                     else:
